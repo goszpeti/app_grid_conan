@@ -6,14 +6,19 @@ try:
     from typing import TypedDict
 except ImportError:
     from typing_extensions import TypedDict
-from conan_app_launcher.base import Logger
+
 from conans import __version__ as conan_version
 from conans.client.conan_api import ClientCache, ConanAPIV1, UserIO
 from conans.model.ref import ConanFileReference, PackageReference
+
 try:
     from conans.util.windows import CONAN_LINK, CONAN_REAL_PATH, rm_conandir, path_shortener
 except:
     pass
+
+from conan_app_launcher.base import Logger
+from conan_app_launcher.settings import CONAN_USER_ALIASES
+import conan_app_launcher as this
 
 
 class ConanPkg(TypedDict):
@@ -82,26 +87,24 @@ class ConanApi():
         if package:
             return self.get_package_folder(conan_ref, package)
 
-        packages: List[ConanPkg] = self.search_in_remotes(conan_ref, input_options)
+        packages: List[ConanPkg] = self.search_package_in_remotes(conan_ref, input_options)
         if not packages:
             return Path("NULL")
 
-        # TODO which one to install?
         if self.install_package(conan_ref, packages[0]):
             package = self.get_local_package(conan_ref, input_options)
             return self.get_package_folder(conan_ref, package)
         return Path("NULL")
 
-    def search_for_all_recipes(self, conan_ref: ConanFileReference) -> List[ConanFileReference]:
-        """ Sreach in all remotes for all versions of a conan ref """
+    def search_query_in_remotes(self, query: str) -> List[ConanFileReference]:
+        """ Search in all remotes for all versions of a conan ref """
         res_list = []
         try:
             # no query possible with pattern
-            search_results = self.conan.search_recipes(f"{conan_ref.name}/*@{conan_ref.user}/*",
-                                                       remote_name="all").get("results", None)
-
+            search_results = self.conan.search_recipes(query, remote_name="all").get("results", None)
         except Exception:
             return []
+
         for res in search_results:
             for item in res.get("items", []):
                 res_list.append(ConanFileReference.loads(item.get("recipe", {}).get("id", "")))
@@ -109,7 +112,36 @@ class ConanApi():
         res_list.sort()
         return res_list
 
-    def search_in_remotes(self, conan_ref: ConanFileReference, input_options: Dict[str, str] = {}) -> List[ConanPkg]:
+    def search_recipe_in_remotes(self, conan_ref: ConanFileReference) -> List[ConanFileReference]:
+        """ Search in all remotes for all versions of a conan ref """
+        res_list = []
+        users_to_search: set = set([conan_ref.user])
+        user_aliases: Dict[str, [str]] = this.settings.get(CONAN_USER_ALIASES)
+        for aliases in user_aliases.values():
+            alias_list = aliases.split(",")
+            if conan_ref.user in alias_list:
+                for alias in alias_list:
+                    users_to_search.add(alias)
+                break # take the first entry
+        for user in users_to_search:
+            try:
+                # no query possible with pattern
+                search_results = self.conan.search_recipes(f"{conan_ref.name}/*@{user}/*",
+                                                        remote_name="all").get("results", None)
+                if this.SEARCH_APP_VERSIONS_IN_LOCAL_CACHE:
+                    local_results = self.conan.search_recipes(f"{conan_ref.name}/*@{user}/*",
+                                                            remote_name=None).get("results", None)
+            except Exception:
+                return []
+        search_results = search_results + local_results
+        for res in search_results:
+            for item in res.get("items", []):
+                res_list.append(ConanFileReference.loads(item.get("recipe", {}).get("id", "")))
+        res_list = list(set(res_list))  # make unique
+        res_list.sort()
+        return res_list
+
+    def search_package_in_remotes(self, conan_ref: ConanFileReference, input_options: Dict[str, str] = {}) -> List[ConanPkg]:
         """ Find a package with options in the remotes """
         remotes = self.cache.registry.load_remotes()
         for remote in remotes.items():
@@ -168,6 +200,10 @@ class ConanApi():
         This method tries to find the best matching packages either locally or in a remote, 
         based on the users machine and the supplied options.
         """
+        # skip search on default invalid recipe
+        if str(conan_ref) == this.INVALID_CONAN_REF:
+            return []
+
         found_pkgs: List[ConanPkg] = []
         default_settings: Dict[str, str] = dict(self.cache.default_profile.settings)
         try:
@@ -203,6 +239,7 @@ class ConanApi():
         if min_opts_set:
             min_opts_list = min_opts_set.pop()
 
+        # TODO this calls external code of the recipe - try catch?
         default_options = self._resolve_default_options(
             self.conan.inspect(str(conan_ref), attributes=["default_options"]).get("default_options", {}))
 
@@ -257,7 +294,8 @@ def _create_key_value_pair_list(input_dict: Dict[str, str]) -> List[str]:
         return res_list
     for name, value in input_dict.items():
         value = str(value)
-        if value.lower() == "any":
+        # this is not really safe, but there can be wild values...
+        if "any" in value.lower():
             continue
         res_list.append(name + "=" + value)
     return res_list
